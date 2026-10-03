@@ -1,0 +1,5 @@
+vosk
+piper-tts
+python-escpos
+sounddevice
+requests
