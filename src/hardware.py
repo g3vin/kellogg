@@ -45,14 +45,11 @@ PIN_HALL = 22
 PIN_SPARE = 26
 PIN_AMP = 16
 
-# Debounce. The hookswitch is a mechanical lever and bounces for several
-# milliseconds. The Hall sensor is a solid-state switch and barely bounces at
-# all, so its window is kept short to avoid swallowing fast crank pulses.
+# Debounce
 HOOK_BOUNCE_S = 0.05
 HALL_BOUNCE_S = 0.02
 
-# Crank detection: how many magnet passes, inside what window, counts as
-# "the caller is cranking" rather than someone bumping the furniture.
+# Crank detection
 CRANK_PULSES = 3
 CRANK_WINDOW_S = 2.0
 CRANK_COOLDOWN_S = 3.0
@@ -127,17 +124,10 @@ class PhoneHardware:
         self.crank = CrankDetector()
         self.hall_pulse_count = 0
 
-        # pull_up=True means "pressed" == pin pulled to ground.
-        # Hookswitch wiring: handset resting in the cradle depresses the
-        # lever, closing COM-NO, which grounds the pin. So:
-        #     pressed  == handset DOWN  (on-hook)
-        #     released == handset UP    (off-hook)
         self.hook = Button(PIN_HOOK, pull_up=True, bounce_time=HOOK_BOUNCE_S)
         self.hall = Button(PIN_HALL, pull_up=True, bounce_time=HALL_BOUNCE_S)
         self.spare = Button(PIN_SPARE, pull_up=True, bounce_time=HOOK_BOUNCE_S)
 
-        # PAM8302 SD: LOW shuts the amplifier down. Start muted so the
-        # earpiece is silent while the handset sits in the cradle.
         self.amp = DigitalOutputDevice(PIN_AMP, initial_value=False)
 
         self.hook.when_pressed = self._handset_replaced
@@ -180,8 +170,6 @@ class PhoneHardware:
         if self.on_hall_pulse:
             self.on_hall_pulse()
 
-        # On-hook cranking is ignored on purpose. Otherwise every visitor,
-        # child and cat that spins the handle places a call.
         if self.crank_requires_off_hook and not self.off_hook:
             return
 
@@ -215,16 +203,16 @@ def _run_events() -> None:
     start = time.monotonic()
 
     def off_hook() -> None:
-        print(f"{_stamp(start)} HANDSET LIFTED   amp enabled")
+        print(f"{_stamp(start)} HANDSET LIFTED amp enabled")
 
     def on_hook() -> None:
         print(f"{_stamp(start)} HANDSET REPLACED amp muted")
 
     def cranked() -> None:
-        print(f"{_stamp(start)} *** CRANK DETECTED - operator would answer ***")
+        print(f"{_stamp(start)} CRANK DETECTED")
 
     def pulse() -> None:
-        print(f"{_stamp(start)}   hall pulse")
+        print(f"{_stamp(start)} HALL PULSE")
 
     with PhoneHardware(
         on_off_hook=off_hook,
