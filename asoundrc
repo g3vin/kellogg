@@ -1,0 +1,89 @@
+# Kellogg magneto phone - ALSA device sharing.
+#
+# Install as ~/.asoundrc   then restart baresip and kellogg.
+#
+# WHY
+#
+# Two processes want the one USB sound card: baresip during a call, and
+# the Python app for the operator's voice and the recogniser. A raw ALSA
+# hw: device is EXCLUSIVE - whoever opens it first wins and the other
+# gets "Device unavailable" or "Device or resource busy". That is what
+# happens today the moment a call connects.
+#
+# dmix and dsnoop are ALSA's software mixing plugins: dmix lets several
+# processes play at once, dsnoop lets several capture at once. Both are
+# built in, no daemon, no PipeWire.
+#
+# THE CARD INDEX
+#
+# Deliberately NOT written as hw:1,0. Card indices move between boots -
+# this card has been index 1 and index 3 on the same Pi - so everything
+# here addresses it by CARD name instead. Check yours with:
+#
+#     cat /proc/asound/cards
+#
+# and if it is not called "Device", change the three CARD= lines below.
+
+pcm.kellogg_dmix {
+    type dmix
+    # Any unique number; it names the shared memory segment that lets
+    # separate processes find the same mixing buffer.
+    ipc_key 2748
+    ipc_perm 0660
+    slave {
+        pcm "hw:CARD=Device,DEV=0"
+        # 48 kHz because that is what this card actually opens at, and
+        # dmix cannot resample - a mismatch here fails at open time.
+        rate 48000
+        channels 2
+        format S16_LE
+        period_size 1024
+        buffer_size 8192
+    }
+}
+
+pcm.kellogg_dsnoop {
+    type dsnoop
+    ipc_key 2749
+    ipc_perm 0660
+    slave {
+        pcm "hw:CARD=Device,DEV=0"
+        rate 48000
+        channels 1
+        format S16_LE
+        period_size 1024
+        buffer_size 8192
+    }
+}
+
+# The plug layer on top converts rates and channel counts, so callers
+# can ask for 16 kHz mono (Vosk) or 22.05 kHz (Piper) without caring.
+pcm.kellogg_out {
+    type plug
+    slave.pcm "kellogg_dmix"
+}
+
+pcm.kellogg_in {
+    type plug
+    slave.pcm "kellogg_dsnoop"
+}
+
+# A duplex device combining both, which is what baresip wants.
+pcm.kellogg {
+    type asym
+    playback.pcm "kellogg_out"
+    capture.pcm "kellogg_in"
+}
+
+# Make the shared device the default, so anything that does not name a
+# device explicitly still shares rather than grabbing the card.
+pcm.!default {
+    type asym
+    playback.pcm "kellogg_out"
+    capture.pcm "kellogg_in"
+}
+
+ctl.!default {
+    type hw
+    card Device
+}

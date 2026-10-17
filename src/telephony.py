@@ -47,7 +47,9 @@ from __future__ import annotations
 import abc
 import argparse
 import json
+import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -73,6 +75,9 @@ BARESIP_PORT = 4444
 
 CALL_STATES = ("dialing", "ringing", "connected", "ended")
 DIRECTIONS = ("outbound", "inbound")
+
+
+_log = logging.getLogger("kellogg.telephony")
 
 
 class TelephonyError(RuntimeError):
@@ -624,8 +629,29 @@ class SipTelephony(Telephony):
     def start(self) -> None:
         self._sms = self._build_sms()
         self._ctrl.connect()
-        self._detail = "connected to baresip, waiting for registration"
+        self._detail = "connected to baresip, asking for registration state"
         self._sms.start()
+
+        # ASK, do not wait. baresip announces REGISTER_OK once, when it
+        # registers at startup - which is before this process connects,
+        # so the announcement is long gone and waiting for it means
+        # believing we are unregistered forever.
+        try:
+            self._ctrl.command("reginfo")
+        except TelephonyError:
+            return
+
+        # Wait briefly for the answer. The reply lands on the reader
+        # thread, so without this start() returns before it arrives and
+        # the status logged at boot says NOT registered regardless of
+        # the truth - which is alarming and wrong.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not self._registered:
+            time.sleep(0.05)
+        if not self._registered:
+            self._detail = ("baresip did not report a registered account "
+                            "within 2s - check: systemctl --user status "
+                            "baresip")
 
     def stop(self) -> None:
         if self._sms is not None:
@@ -672,21 +698,47 @@ class SipTelephony(Telephony):
             pass
         self._emit_ended(reason)
 
+    def _note_registered(self, value: bool, detail: str) -> None:
+        """Set the flag and fire the callback only on a real change."""
+        changed = value != self._registered
+        self._registered = value
+        self._detail = detail
+        if changed and self.on_registration:
+            self.on_registration(value)
+
     def _on_baresip_event(self, event: dict) -> None:
         """Translate baresip's vocabulary into ours. Short, as required."""
         kind = event.get("type") or event.get("event") or ""
         peer = event.get("peeruri") or event.get("param") or ""
 
+        # Every event, verbatim, at debug. This is the one part of the
+        # build that has never been checked against real traffic, so the
+        # raw stream is the only way to find out what baresip actually
+        # says rather than what its documentation implies.
+        _log.debug("baresip: %s", json.dumps(event, sort_keys=True))
+
+        # A reginfo reply is a RESPONSE, not an event, and it is a
+        # rendered text table rather than structured data:
+        #
+        #   --- User Agents (2) ---
+        #   0 - sip:kellogg@domain   \x1b[32mOK \x1b[;m Twilio Expires 600s
+        #
+        # It never contains the word "REGISTER", and the status is
+        # wrapped in ANSI colour codes, so anything looking for a tidy
+        # REGISTER_OK finds nothing and concludes we are offline.
+        if event.get("response") and isinstance(event.get("data"), str):
+            if reginfo_registered(event["data"]):
+                self._note_registered(True, "registered with the SIP trunk")
+            elif "User Agents" in event["data"]:
+                self._note_registered(
+                    False, "baresip has accounts but none are registered")
+            return
+
         if kind in ("REGISTER_OK",):
-            self._registered = True
-            self._detail = "registered with the SIP trunk"
-            if self.on_registration:
-                self.on_registration(True)
+            self._note_registered(True, "registered with the SIP trunk")
         elif kind in ("REGISTER_FAIL", "UNREGISTERING"):
-            self._registered = False
-            self._detail = f"registration failed: {event.get('param', '')}"
-            if self.on_registration:
-                self.on_registration(False)
+            self._note_registered(
+                False, f"registration failed: {event.get('param', '')}")
         elif kind == "CALL_INCOMING":
             self._emit_incoming(_sip_number(peer))
         elif kind == "CALL_ESTABLISHED":
@@ -695,6 +747,25 @@ class SipTelephony(Telephony):
                     self.current.state = "connected"
         elif kind in ("CALL_CLOSED", "CALL_TERMINATED"):
             self._emit_ended(event.get("param") or "remote")
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def reginfo_registered(data: str) -> bool:
+    """True when baresip's reginfo table shows a registered account.
+
+    Parsed rather than pattern-matched on the whole blob, because the
+    table lists every account and one failing account must not be hidden
+    by another that worked.
+    """
+    clean = _ANSI.sub("", data)
+    for line in clean.splitlines():
+        if "sip:" not in line:
+            continue
+        if re.search(r"(?<![A-Za-z])OK(?![A-Za-z])", line):
+            return True
+    return False
 
 
 def _sip_number(uri: str) -> str:
@@ -840,6 +911,36 @@ def _selftest() -> int:
     ctrl._buf = b"notanumber:garbage,"
     ctrl._drain()
     ok(True, "malformed framing does not raise")
+
+    # --- reginfo parsing, against the real reply from the Pi ---
+    real = ("\n--- User Agents (2) ---\n"
+            "0 - sip:kellogg@kellogg-g3vin.sip.twilio.com   "
+            "\x1b[32mOK \x1b[;m Twilio Expires 600s\n\n")
+    ok(reginfo_registered(real),
+       "baresip's reginfo table is recognised as registered")
+    ok(not reginfo_registered(
+        "--- User Agents (1) ---\n0 - sip:a@b  \x1b[31mERR \x1b[;m 401\n"),
+       "a failed registration is not read as success")
+    ok(not reginfo_registered("--- User Agents (0) ---\n"),
+       "no accounts means not registered")
+    ok(not reginfo_registered("something OKAY without a uri"),
+       "OKAY inside a word is not a status of OK")
+    ok(reginfo_registered("0 - sip:a@b   OK  Expires 600s"),
+       "the table parses without ansi colour codes too")
+
+    # the response path sets the flag, which is what the event path missed
+    t = SipTelephony.__new__(SipTelephony)
+    Telephony.__init__(t)
+    t._registered = False
+    t._detail = ""
+    t._ctrl = None
+    fired: list = []
+    t.on_registration = fired.append
+    t._on_baresip_event({"response": True, "ok": True, "data": real})
+    ok(t.registered, "a reginfo response marks the trunk registered")
+    ok(fired == [True], "and fires on_registration exactly once")
+    t._on_baresip_event({"response": True, "ok": True, "data": real})
+    ok(fired == [True], "a repeat response does not fire it again")
 
     # --- SIP uri parsing ---
     ok(_sip_number("sip:+15555550123@kellogg.sip.twilio.com")
