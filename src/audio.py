@@ -153,7 +153,16 @@ def noise_advice(peak: float, rms: float, bands: dict) -> str:
     worst = max(bands, key=lambda k: bands[k])
     detail = "  ".join(f"{k} {v:.1f}" for k, v in bands.items())
 
-    if worst == "sub" and _dominant(bands):
+    # A constant has peak == rms and no spectral content anywhere. Catch
+    # it before any band reasoning, because every band reads the floor and
+    # whichever is nominally "highest" is meaningless.
+    if peak - rms < 3.0 and max(bands.values()) < rms - 40.0:
+        cause = ("Peak and average are the same and no band carries any "
+                 "energy - this is a DC level, not noise. If the input was "
+                 "shorted for this measurement, that is just the ADC's own "
+                 "offset and it is harmless. If it was not, the coupling "
+                 "capacitor is passing DC and should be checked.")
+    elif worst == "sub" and _dominant(bands):
         cause = ("The energy is BELOW the mains frequency - DC offset or "
                  "subsonic drift, not audible noise. The usual cause is "
                  "the coupling capacitor passing DC: check its polarity "
@@ -232,6 +241,11 @@ class AudioConfig:
     aec_source: Optional[str] = None
     aec_sink: Optional[str] = None
     detected_at: str = ""
+    # The hint that found these devices. PortAudio names embed the card
+    # index - "USB Audio Device: - (hw:3,0)" - so a saved name goes stale
+    # the moment the index moves, which is the exact failure this module
+    # exists to prevent. Re-resolving from the hint survives that.
+    hint: str = "USB"
 
     @property
     def capture_device(self) -> str:
@@ -247,6 +261,38 @@ class AudioConfig:
         path = Path(path)
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
         return path
+
+    @classmethod
+    def resolve(cls, path: Path | str = CONFIG_PATH) -> "AudioConfig":
+        """The config to actually use: detected now, file as fallback.
+
+        Always prefers a live scan, because card indices move between
+        boots and the saved device names contain them. The file supplies
+        the hint and is only used wholesale when detection fails.
+        """
+        hint = "USB"
+        saved: Optional[AudioConfig] = None
+        try:
+            saved = cls.load(path)
+            hint = saved.hint or hint
+        except Exception:
+            pass
+
+        try:
+            fresh = find_devices(prefer=hint)
+        except AudioError:
+            if saved is not None:
+                return saved
+            raise
+
+        fresh.hint = hint
+        if saved is None or (saved.capture, saved.playback) != (
+                fresh.capture, fresh.playback):
+            try:
+                fresh.save(path)
+            except Exception:
+                pass
+        return fresh
 
     @classmethod
     def load(cls, path: Path | str = CONFIG_PATH) -> "AudioConfig":
@@ -553,7 +599,7 @@ def measure_noise(seconds: float = 5.0,
 
     advice = noise_advice(peak, rms, bands)
     offset = dc_offset(flat)
-    if abs(offset) > 0.01:
+    if abs(offset) > 0.005:
         advice = (f"DC offset {offset:+.3f} of full scale - the capture is "
                   f"not centred on zero. Fix this before anything else; it "
                   f"eats headroom and the recogniser sees a signal riding "
@@ -681,6 +727,18 @@ def _selftest() -> int:
         path.write_text(json.dumps(data))
         AudioConfig.load(path)
         ok(True, "unknown keys in audio.json are ignored, not fatal")
+
+        # A saved name with a stale card index must not be trusted.
+        stale = Path(tmp) / "stale.json"
+        AudioConfig(capture="USB Audio Device: - (hw:9,0)",
+                    playback="USB Audio Device: - (hw:9,0)",
+                    capture_rate=48000, playback_rate=48000,
+                    hint="USB").save(stale)
+        back = AudioConfig.load(stale)
+        ok(back.hint == "USB", "the detection hint survives a save/load")
+        ok("hw:9,0" in back.capture,
+           "the saved name does embed a card index, which is why "
+           "resolve() rescans rather than trusting it")
 
         missing = Path(tmp) / "nope.json"
         try:

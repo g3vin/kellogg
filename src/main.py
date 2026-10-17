@@ -533,11 +533,15 @@ def build_phone(null_telephony: bool = False, no_gpio: bool = False) -> Phone:
     phone = Phone()
 
     # 1. audio devices, by name
+    # Resolve, not load. Card indices move across reboots and PortAudio
+    # device names contain them, so a name saved last week can match
+    # nothing today. resolve() rescans and only falls back to the file.
     try:
-        cfg = audio.AudioConfig.load()
+        cfg = audio.AudioConfig.resolve()
         log.info("audio: %s", cfg.capture_device)
     except Exception as exc:
-        log.warning("no audio.json (%s) - run: python src/audio.py detect", exc)
+        log.warning("no usable audio device (%s) - run: "
+                    "python src/audio.py devices", exc)
         cfg = None
 
     # 2. contacts

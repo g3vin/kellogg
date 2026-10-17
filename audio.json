@@ -1,9 +1,10 @@
 {
-  "capture": "USB Audio Device: - (hw:3,0)",
-  "playback": "USB Audio Device: - (hw:3,0)",
+  "capture": "USB Audio Device: - (hw:1,0)",
+  "playback": "USB Audio Device: - (hw:1,0)",
   "capture_rate": 48000,
   "playback_rate": 48000,
   "aec_source": null,
   "aec_sink": null,
-  "detected_at": "2026-10-17 17:16:48"
+  "detected_at": "2026-10-17 17:44:43",
+  "hint": "USB"
 }
