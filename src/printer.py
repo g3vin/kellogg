@@ -19,6 +19,12 @@ Three things shape this module:
     python-escpos then fails silently - it accepts the bytes and nothing
     comes out. detect() finds the real endpoints rather than assuming.
 
+Two backends. When the kernel's usblp driver has bound the printer it
+appears as /dev/usb/lp0 and holds the USB interface exclusively, so raw
+pyusb access is impossible; we write ESC/POS straight to the node. That is
+the normal case on this build and needs no udev rule, only membership of
+group lp. Raw USB is the fallback for when no such node exists.
+
 Nothing is ever dropped. A queued message is removed only after the print
 succeeds, so a power cut mid-print costs you a duplicate, never a loss.
 
@@ -37,6 +43,7 @@ Standalone use:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -69,6 +76,18 @@ MAX_ATTEMPTS = 5            # before a queued message is parked, not dropped
 
 RULE = "-" * CHARS_FONT_A
 HEAVY = "=" * CHARS_FONT_A
+
+# Where the kernel puts a printer it has bound with the usblp driver.
+USBLP_GLOB = "/dev/usb/lp*"
+
+
+class PyusbMissing(RuntimeError):
+    """pyusb is absent, so the raw USB backend cannot even be attempted.
+
+    This exists so the absence is reported rather than silently becoming
+    "no printer found", which is a different and much more alarming
+    diagnosis.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -127,17 +146,62 @@ def format_message(sender: str, body: str,
 # --------------------------------------------------------------------------
 @dataclass
 class PrinterConfig:
-    vendor_id: int
-    product_id: int
+    """Where and how to reach the printer.
+
+    Two backends, and the choice is not ours to make. When the kernel's
+    usblp driver binds the printer it claims the USB interface
+    EXCLUSIVELY, so pyusb cannot have it. In that case the device turns up
+    as /dev/usb/lp0 and we write ESC/POS bytes straight to the file. Only
+    when no such node exists do we fall back to raw USB.
+    """
+    vendor_id: int = 0
+    product_id: int = 0
     in_ep: int = DEFAULT_IN_EP
     out_ep: int = DEFAULT_OUT_EP
     profile: Optional[str] = None
     note: str = ""
+    backend: str = "usb"          # "usblp" | "usb"
+    device_path: str = ""         # /dev/usb/lp0, when backend is usblp
 
     def __str__(self) -> str:
+        if self.backend == "usblp":
+            ident = ""
+            if self.vendor_id or self.product_id:
+                ident = f" {self.vendor_id:04x}:{self.product_id:04x}"
+            return (f"{self.device_path}{ident}"
+                    + (f"  ({self.note})" if self.note else ""))
         return (f"{self.vendor_id:04x}:{self.product_id:04x} "
                 f"in_ep=0x{self.in_ep:02x} out_ep=0x{self.out_ep:02x}"
                 + (f"  ({self.note})" if self.note else ""))
+
+    @property
+    def writable(self) -> bool:
+        """usblp only: can this process actually write to the node?"""
+        if self.backend != "usblp":
+            return True
+        return os.access(self.device_path, os.W_OK)
+
+    @classmethod
+    def scan_usblp(cls) -> list["PrinterConfig"]:
+        """Printers the kernel has already bound as line printers.
+
+        Reads the ids out of sysfs when it can, purely so the listing is
+        recognisable. Their absence is not an error.
+        """
+        found: list[PrinterConfig] = []
+        for node in sorted(glob.glob(USBLP_GLOB)):
+            vid = pid = 0
+            name = os.path.basename(node)
+            sysfs = Path(f"/sys/class/usbmisc/{name}/device/../")
+            try:
+                vid = int((sysfs / "idVendor").read_text().strip(), 16)
+                pid = int((sysfs / "idProduct").read_text().strip(), 16)
+            except Exception:
+                pass
+            found.append(cls(vendor_id=vid, product_id=pid,
+                             backend="usblp", device_path=node,
+                             note="kernel usblp"))
+        return found
 
     @classmethod
     def scan(cls) -> list["PrinterConfig"]:
@@ -151,7 +215,13 @@ class PrinterConfig:
             import usb.core
             import usb.util
         except ImportError:
-            return []
+            # Returning [] here would surface as "no printer found", which
+            # is a lie and sent a real debugging session down the wrong
+            # path. Say what is actually wrong.
+            raise PyusbMissing(
+                "pyusb is not installed, so raw USB printers cannot be "
+                "found. Install it with:  sudo apt install python3-usb"
+            ) from None
 
         found: list[PrinterConfig] = []
         try:
@@ -191,8 +261,23 @@ class PrinterConfig:
 
     @classmethod
     def detect(cls) -> Optional["PrinterConfig"]:
-        """Best guess at the printer. Prefers a real USB printer class."""
-        candidates = cls.scan()
+        """Best guess at the printer.
+
+        /dev/usb/lp* wins when it exists. The kernel holds the interface
+        in that case, so a raw USB attempt would fail anyway, and writing
+        to the node needs no endpoint detection and no udev rule.
+        """
+        lp = cls.scan_usblp()
+        if lp:
+            return lp[0]
+
+        try:
+            candidates = cls.scan()
+        except PyusbMissing:
+            # No kernel node and no pyusb: nothing can be opened, but the
+            # caller deserves the real reason rather than a bare None.
+            raise
+
         if not candidates:
             return None
         for c in candidates:
@@ -355,16 +440,55 @@ class Printer:
             return True
 
         if self.config is None:
-            self.config = PrinterConfig.detect()
+            try:
+                self.config = PrinterConfig.detect()
+            except PyusbMissing as exc:
+                self._last_error = str(exc)
+                return False
         if self.config is None:
-            self._last_error = "no USB printer found"
+            self._last_error = (
+                "no printer found: nothing at /dev/usb/lp* and no USB "
+                "printer-class device. Is the 9 V supply connected?")
+            return False
+
+        if self.config.backend == "usblp":
+            return self._open_usblp()
+        return self._open_rawusb()
+
+    def _open_usblp(self) -> bool:
+        """Write ESC/POS straight to the kernel's line-printer node."""
+        path = self.config.device_path
+        if not os.path.exists(path):
+            self._last_error = f"{path} has gone away; is it unplugged?"
+            return False
+        if not os.access(path, os.W_OK):
+            self._last_error = (
+                f"{path} is not writable by this user. Fix it with:\n"
+                f"    sudo usermod -aG lp $USER\n"
+                f"then log out and back in - group changes only apply to "
+                f"new sessions.")
             return False
 
         try:
+            from escpos.printer import File
+            # auto_flush so a message is on paper before we mark it sent;
+            # the queue's whole contract depends on that ordering.
+            self._dev = File(path, auto_flush=True)
+            self._apply_profile()
+            return True
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._dev = None
+            return False
+
+    def _open_rawusb(self) -> bool:
+        try:
             import usb.core  # noqa: F401
         except ImportError:
-            self._last_error = ("pyusb not installed: "
-                                "pip install pyusb")
+            self._last_error = (
+                "pyusb is not installed, so the raw USB backend is "
+                "unavailable. Install it with:  "
+                "sudo apt install python3-usb")
             return False
 
         try:
@@ -590,15 +714,41 @@ class Printer:
 # CLI
 # --------------------------------------------------------------------------
 def _cmd_detect() -> int:
-    found = PrinterConfig.scan()
+    lp = PrinterConfig.scan_usblp()
+    if lp:
+        print(f"  Kernel line printer{'s' if len(lp) > 1 else ''}:\n")
+        for c in lp:
+            mark = "" if c.writable else "   NOT WRITABLE BY YOU"
+            print(f"    {c}{mark}")
+        best = lp[0]
+        print(f"\n  Would use: {best}")
+        if not best.writable:
+            print("\n  You cannot write to it yet:")
+            print("      sudo usermod -aG lp $USER")
+            print("  then log out and back in. Group changes only apply to")
+            print("  new sessions, so reconnecting your SSH session is not")
+            print("  enough on its own if it was already open.")
+            return 1
+        print("\n  The kernel holds this interface, so pyusb cannot have it.")
+        print("  That is normal and the usblp backend is the better path.")
+        return 0
+
+    print("  Nothing at /dev/usb/lp*. Looking for a raw USB device.\n")
+    try:
+        found = PrinterConfig.scan()
+    except PyusbMissing as exc:
+        print(f"  {exc}")
+        return 1
+
     if not found:
-        print("  No USB printer found.\n")
+        print("  No printer found.\n")
         print("  Check in order:")
         print("    1. the 9 V supply is connected (USB alone will not do it)")
+        print("       and the barrel polarity is right - reversed reads -9 V")
         print("    2. lsusb lists the device")
-        print("    3. you have permission:")
-        print("       sudo usermod -aG plugdev,lp $USER   then log out and in")
+        print("    3. the USB cable carries data, not just power")
         return 1
+
     print(f"  {len(found)} candidate device(s):\n")
     for c in found:
         print(f"    {c}")

@@ -34,6 +34,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import shutil
+import logging
+import re
 import subprocess
 import sys
 import tempfile
@@ -50,12 +52,14 @@ CACHE_DIR = ROOT / "sounds" / "cache"
 
 DEFAULT_VOICE = "en_US-lessac-medium"
 
-# Telephone band
+# Telephone band. Real receivers roll off hard outside this, and matching it
+# makes synthesised speech sit naturally in the handset.
 TELEPHONE_LOW_HZ = 300.0
 TELEPHONE_HIGH_HZ = 3400.0
 FIR_TAPS = 255
 
-# Fixed phrases the operator says
+# Fixed phrases the operator says. Rendered once, cached, played instantly.
+# Keep them short: a long prompt makes the phone feel like a phone tree.
 PROMPTS: dict[str, str] = {
     "greeting":       "Operator. Number please.",
     "confirm_prefix": "Did you say",
@@ -160,6 +164,54 @@ def readback_text(name: Optional[str], number: str) -> str:
 # --------------------------------------------------------------------------
 # the voice
 # --------------------------------------------------------------------------
+_HW_RE = re.compile(r"\((hw:\d+(?:,\d+)?)\)")
+
+
+def _alsa_name(device) -> str:
+    """Turn a PortAudio device name into something aplay accepts.
+
+    PortAudio reports "USB Audio Device: - (hw:3,0)". ALSA has never
+    heard of that string; it wants the "hw:3,0" hiding inside the
+    parentheses. An index is passed through as-is, and anything already
+    looking like an ALSA name is left alone.
+    """
+    if device is None:
+        return ""
+    if isinstance(device, int):
+        return f"hw:{device},0"
+    text = str(device)
+    if not text:
+        return ""
+    m = _HW_RE.search(text)
+    if m:
+        return m.group(1)
+    if text.startswith(("hw:", "plughw:", "default", "sysdefault", "dmix")):
+        return text
+    # A bare card name works with the CARD= form.
+    return f"plughw:CARD={text.split(':')[0].replace(' ', '_')},DEV=0"
+
+
+def _resample(samples, src_rate: int, dst_rate: int):
+    """Linear resample. Adequate for speech, and no scipy dependency.
+
+    Only ever used to go UP from Piper's 22.05 kHz to the card's 44.1 or
+    48 kHz, where there is no aliasing to worry about.
+    """
+    import numpy as np
+
+    data = np.asarray(samples)
+    if src_rate == dst_rate or data.size == 0:
+        return data
+    flat = data.reshape(-1) if data.ndim > 1 else data
+    n_out = max(1, int(round(flat.size * dst_rate / src_rate)))
+    src_idx = np.linspace(0.0, flat.size - 1, n_out)
+    out = np.interp(src_idx, np.arange(flat.size), flat.astype(np.float64))
+    return out.astype(data.dtype)
+
+
+_log = logging.getLogger("kellogg.tts")
+
+
 class OperatorVoice:
     def __init__(
         self,
@@ -171,6 +223,7 @@ class OperatorVoice:
         self.model_path = Path(model) if model else self._find_model()
         self.telephone = telephone
         self.device = device
+        self._out_rate: Optional[int] = None
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._voice = None          # lazily loaded, then kept forever
@@ -287,19 +340,50 @@ class OperatorVoice:
 
     # ---------------- playback ----------------
 
+    def _playback_rate(self, sd, native: int) -> int:
+        """A rate this device will actually open at.
+
+        Piper emits 22.05 kHz and USB dongles usually offer only 44.1 and
+        48 kHz. PortAudio does not resample a raw device, so playing the
+        native rate straight out fails with -9997 Invalid sample rate and
+        the operator is silent for no visible reason.
+        """
+        if self._out_rate is not None:
+            return self._out_rate
+        for rate in (native, 48000, 44100, 32000):
+            try:
+                sd.check_output_settings(device=self.device, channels=1,
+                                         samplerate=rate)
+                self._out_rate = rate
+                return rate
+            except Exception:
+                continue
+        self._out_rate = native
+        return native
+
     def play_file(self, path: Path, blocking: bool = True) -> None:
         try:
             import sounddevice as sd
+            import numpy as np
+
             samples, rate = _read_wav(Path(path))
-            sd.play(samples, rate, device=self.device)
+            out_rate = self._playback_rate(sd, rate)
+            if out_rate != rate:
+                samples = _resample(samples, rate, out_rate)
+            sd.play(samples, out_rate, device=self.device)
             if blocking:
                 sd.wait()
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("sounddevice playback failed (%s), trying aplay", exc)
+
+        # aplay speaks ALSA PCM names, NOT PortAudio device names. Passing
+        # "USB Audio Device: - (hw:3,0)" here produces "Unknown PCM", so
+        # translate it back to the hw:N,M that ALSA understands.
         cmd = ["aplay", "-q"]
-        if self.device:
-            cmd += ["-D", self.device]
+        alsa = _alsa_name(self.device)
+        if alsa:
+            cmd += ["-D", alsa]
         cmd.append(str(path))
         (subprocess.run if blocking else subprocess.Popen)(cmd)
 

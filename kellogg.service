@@ -1,0 +1,67 @@
+# Kellogg magneto phone - systemd USER unit.
+#
+# A user unit, not a system one, and that is a decision rather than an
+# accident. PipeWire runs in the user session, and the echo canceller it
+# creates lives there too. A system service runs outside that session and
+# cannot see the virtual AEC devices at all - it would find the raw sound
+# card, the operator would hear itself through the earpiece, and the
+# recogniser would be listening to a mixture of the caller and the
+# operator's own voice.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp kellogg.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kellogg
+#
+# And, critically:
+#   sudo loginctl enable-linger g3vin
+#
+# Without lingering the user session ends when SSH disconnects, taking the
+# phone with it. It would work perfectly while you were logged in and die
+# the moment you closed the laptop.
+#
+# Watch it:   journalctl --user -u kellogg -f
+# Restart:    systemctl --user restart kellogg
+
+[Unit]
+Description=Kellogg magneto phone
+Documentation=https://github.com/g3vin/kellogg
+After=network-online.target pipewire.service pipewire-pulse.service
+Wants=network-online.target
+# If PipeWire dies the phone cannot hear or speak; follow it down and back.
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kellogg
+
+# Credentials. The leading - means a missing file is not fatal: the phone
+# falls back to NullTelephony and still answers off-hook, which is better
+# than refusing to start.
+EnvironmentFile=-%h/kellogg/.env
+
+ExecStart=%h/kellogg/venv/bin/python %h/kellogg/src/main.py
+
+# Power cuts are routine on this build - there is no UPS and the SD card
+# is the only storage. Coming back unattended is the whole point.
+Restart=always
+RestartSec=5
+
+# Do not let a persistent crash loop hammer the SD card.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Unbuffered, or the journal shows nothing until the process dies.
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kellogg
+
+# Give the GPIO and audio handles time to close cleanly.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

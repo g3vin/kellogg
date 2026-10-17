@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 import wave
@@ -45,6 +46,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_DIR = ROOT / "models"
 DEFAULT_MODEL = "vosk-model-small-en-us-0.15"
+
+_log = logging.getLogger("kellogg.asr")
 
 SAMPLE_RATE = 16000          # Vosk small models want 16 kHz mono
 BLOCK = 4000                 # frames per read, 250 ms
@@ -184,6 +187,7 @@ class Listener:
         self.model_path = Path(model_path) if model_path else self._find_model()
         self.grammar = grammar
         self.device = device
+        self._cap_rate: Optional[int] = None
         self.min_confidence = min_confidence
         self.silence_rms = silence_rms
         self._model = None
@@ -283,6 +287,30 @@ class Listener:
 
     # ---------------- live input ----------------
 
+    def _capture_rate(self, sd) -> int:
+        """The highest rate this device will actually open at.
+
+        Asked once and remembered. 16 kHz is tried first because when a
+        device does support it there is no resampling to do.
+        """
+        if self._cap_rate is not None:
+            return self._cap_rate
+        for rate in (SAMPLE_RATE, 48000, 44100, 32000, 22050):
+            try:
+                sd.check_input_settings(device=self.device, channels=1,
+                                        samplerate=rate, dtype="int16")
+                self._cap_rate = rate
+                if rate != SAMPLE_RATE:
+                    _log.debug("capturing at %d Hz, resampling to %d",
+                               rate, SAMPLE_RATE)
+                return rate
+            except Exception:
+                continue
+        raise RuntimeError(
+            f"{self.device or 'the default device'} would not open for "
+            f"capture at any usable rate. Check:  "
+            f"python src/audio.py devices")
+
     def listen(
         self,
         timeout: float = DEFAULT_TIMEOUT,
@@ -301,7 +329,14 @@ class Listener:
         heard_speech = False
         quiet_since: Optional[float] = None
 
-        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK,
+        # Open at a rate the CARD supports and resample to 16 kHz here.
+        # USB dongles are 44.1/48 kHz only and PortAudio does not resample
+        # a raw device, so asking for 16 kHz fails with -9997 Invalid
+        # sample rate - which reads like a broken microphone.
+        cap_rate = self._capture_rate(sd)
+        cap_block = int(BLOCK * cap_rate / SAMPLE_RATE)
+
+        with sd.RawInputStream(samplerate=cap_rate, blocksize=cap_block,
                                dtype="int16", channels=1,
                                device=self.device) as stream:
             while True:
@@ -313,8 +348,11 @@ class Listener:
                         res = ASRResult("timeout", elapsed=now - t0)
                     return res
 
-                data, _ = stream.read(BLOCK)
+                data, _ = stream.read(cap_block)
                 block = np.frombuffer(bytes(data), dtype=np.int16)
+                if cap_rate != SAMPLE_RATE:
+                    block = resample_to_16k(block, cap_rate)
+                    data = block.astype(np.int16).tobytes()
                 level = rms(block)
 
                 if level > self.silence_rms:

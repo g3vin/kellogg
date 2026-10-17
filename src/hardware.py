@@ -21,6 +21,8 @@ Run it on its own to exercise the sensors:
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import signal
 import sys
 import time
@@ -40,18 +42,44 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------
 # Pin assignments
 # --------------------------------------------------------------------------
+_log = logging.getLogger("kellogg.hardware")
+
 PIN_HOOK = 17
+
+# Which way the cradle works the micro switch.
+#
+# The plan assumes NO wired so that the handset SITTING IN THE CRADLE
+# presses the switch and grounds the pin. Real cradles differ - some
+# press on lift instead, and some builds end up on NC - so this is a
+# setting rather than an assumption. Flip it without touching the
+# soldering by putting this in .env:
+#
+#     KELLOGG_HOOK_INVERTED=1
+#
+# Verify with:  python src/hardware.py   and lift the handset.
+HOOK_INVERTED = os.environ.get("KELLOGG_HOOK_INVERTED", "") not in ("", "0")
 PIN_HALL = 22
 PIN_SPARE = 26
 PIN_AMP = 16
 
-# Debounce
+# Debounce. The hookswitch is a mechanical lever and bounces for several
+# milliseconds. The Hall sensor is a solid-state switch and barely bounces at
+# all, so its window is kept short to avoid swallowing fast crank pulses.
 HOOK_BOUNCE_S = 0.05
 HALL_BOUNCE_S = 0.02
 
-# Crank detection
-CRANK_PULSES = 3
-CRANK_WINDOW_S = 2.0
+# Crank detection: how many magnet passes, inside what window, counts as
+# "the caller is cranking" rather than someone bumping the furniture.
+# Measured on the real crank: one pulse per revolution, gaps of 0.6 to
+# 1.6 s at a natural cranking pace - roughly 36 to 100 rpm. Requiring 3
+# pulses in 2 s meant sustaining about 90 rpm, which only the fastest
+# bursts reached, so an ordinary crank never registered.
+#
+# 2 pulses in 3 s needs about 40 rpm: comfortably within a normal turn,
+# while still refusing to fire on one stray pulse from a knock or from
+# the magnet settling next to the sensor at rest.
+CRANK_PULSES = 2
+CRANK_WINDOW_S = 3.0
 CRANK_COOLDOWN_S = 3.0
 
 
@@ -112,6 +140,7 @@ class PhoneHardware:
         on_crank: Optional[Callable[[], None]] = None,
         on_hall_pulse: Optional[Callable[[], None]] = None,
         crank_requires_off_hook: bool = True,
+        hook_inverted: Optional[bool] = None,
         auto_mute_on_hook: bool = True,
     ) -> None:
         self.on_off_hook = on_off_hook
@@ -119,27 +148,50 @@ class PhoneHardware:
         self.on_crank = on_crank
         self.on_hall_pulse = on_hall_pulse
         self.crank_requires_off_hook = crank_requires_off_hook
+        # Resolved here, not as a default argument: a default is bound
+        # when the class is defined, so --invert-hook setting the module
+        # global afterwards would silently do nothing.
+        self.hook_inverted = (HOOK_INVERTED if hook_inverted is None
+                              else hook_inverted)
+        self.cranks_dropped_on_hook = 0
         self.auto_mute_on_hook = auto_mute_on_hook
 
         self.crank = CrankDetector()
         self.hall_pulse_count = 0
 
+        # pull_up=True means "pressed" == pin pulled to ground.
+        # Hookswitch wiring: handset resting in the cradle depresses the
+        # lever, closing COM-NO, which grounds the pin. So:
+        #     pressed  == handset DOWN  (on-hook)
+        #     released == handset UP    (off-hook)
         self.hook = Button(PIN_HOOK, pull_up=True, bounce_time=HOOK_BOUNCE_S)
         self.hall = Button(PIN_HALL, pull_up=True, bounce_time=HALL_BOUNCE_S)
         self.spare = Button(PIN_SPARE, pull_up=True, bounce_time=HOOK_BOUNCE_S)
 
+        # PAM8302 SD: LOW shuts the amplifier down. Start muted so the
+        # earpiece is silent while the handset sits in the cradle.
         self.amp = DigitalOutputDevice(PIN_AMP, initial_value=False)
 
-        self.hook.when_pressed = self._handset_replaced
-        self.hook.when_released = self._handset_lifted
+        if self.hook_inverted:
+            self.hook.when_pressed = self._handset_lifted
+            self.hook.when_released = self._handset_replaced
+        else:
+            self.hook.when_pressed = self._handset_replaced
+            self.hook.when_released = self._handset_lifted
         self.hall.when_pressed = self._hall_edge
 
     # ---------------- state ----------------
 
     @property
     def off_hook(self) -> bool:
-        """True when the handset has been lifted out of the cradle."""
-        return not self.hook.is_pressed
+        """True when the handset has been lifted out of the cradle.
+
+        is_pressed, not value: pull_up=True inverts the reading, so
+        .value is 1 when the pin is pulled to GROUND. Reading .value == 0
+        here would be backwards and would look like it worked.
+        """
+        pressed = self.hook.is_pressed
+        return pressed if self.hook_inverted else not pressed
 
     @property
     def amp_enabled(self) -> bool:
@@ -170,7 +222,20 @@ class PhoneHardware:
         if self.on_hall_pulse:
             self.on_hall_pulse()
 
+        # On-hook cranking is ignored on purpose. Otherwise every visitor,
+        # child and cat that spins the handle places a call.
         if self.crank_requires_off_hook and not self.off_hook:
+            # Silently dropping these made a backwards hookswitch look
+            # like a dead Hall sensor: pulses arrived, nothing happened,
+            # and nothing said why.
+            self.cranks_dropped_on_hook += 1
+            if self.cranks_dropped_on_hook in (1, 5, 20):
+                _log.warning(
+                    "crank pulse ignored - the handset reads ON-HOOK "
+                    "(%d so far). If it is actually lifted, the hookswitch "
+                    "sense is inverted: set KELLOGG_HOOK_INVERTED=1 in "
+                    ".env, or run with --invert-hook to check.",
+                    self.cranks_dropped_on_hook)
             return
 
         if self.crank.pulse() and self.on_crank:
@@ -203,16 +268,16 @@ def _run_events() -> None:
     start = time.monotonic()
 
     def off_hook() -> None:
-        print(f"{_stamp(start)} HANDSET LIFTED amp enabled")
+        print(f"{_stamp(start)} HANDSET LIFTED   amp enabled")
 
     def on_hook() -> None:
         print(f"{_stamp(start)} HANDSET REPLACED amp muted")
 
     def cranked() -> None:
-        print(f"{_stamp(start)} CRANK DETECTED")
+        print(f"{_stamp(start)} *** CRANK DETECTED - operator would answer ***")
 
     def pulse() -> None:
-        print(f"{_stamp(start)} HALL PULSE")
+        print(f"{_stamp(start)}   hall pulse")
 
     with PhoneHardware(
         on_off_hook=off_hook,
@@ -262,11 +327,75 @@ def _run_raw() -> None:
             print(f"\n  total pulses: {hw.hall_pulse_count}")
 
 
+def _selftest() -> int:
+    """CrankDetector only - no GPIO, no crank, no magnet."""
+    checks: list[tuple[bool, str]] = []
+
+    def ok(cond, label):
+        checks.append((bool(cond), label))
+
+    # Real timestamps captured from the actual crank with --raw.
+    # One pulse per revolution, gaps 0.6-1.6 s.
+    real = [2.11, 3.34, 4.98, 8.05, 9.48, 10.30, 10.92, 11.94, 12.97,
+            13.58, 14.20, 15.01, 15.63, 16.24, 17.88, 18.91]
+
+    d = CrankDetector()
+    fired = [t for t in real if d.pulse(now=t)]
+    ok(len(fired) >= 3, "an ordinary crank fires repeatedly")
+    ok(fired and fired[0] - real[0] < 4.0,
+       "it fires within a few seconds of starting to crank")
+
+    old = CrankDetector(pulses_needed=3, window_s=2.0)
+    old_fired = [t for t in real if old.pulse(now=t)]
+    ok(len(fired) > len(old_fired),
+       "the current threshold is more forgiving than 3-in-2s was")
+
+    ok(not CrankDetector().pulse(now=100.0),
+       "one stray pulse never fires")
+
+    d = CrankDetector()
+    d.pulse(now=200.0)
+    ok(not d.pulse(now=205.0),
+       "two pulses far apart are not a crank")
+
+    d = CrankDetector()
+    ok(not d.pulse(now=300.0), "first of a pair does not fire")
+    ok(d.pulse(now=301.0), "second within the window does fire")
+    ok(not d.pulse(now=301.5), "cooldown suppresses an immediate refire")
+    ok(not d.pulse(now=306.0),
+       "after the cooldown, one pulse alone still does not fire")
+    ok(d.pulse(now=307.0),
+       "a second pulse after the cooldown fires again")
+
+    d = CrankDetector()
+    for t in (400.0, 400.5):
+        d.pulse(now=t)
+    d.reset()
+    ok(not d.pulse(now=400.7), "reset clears the accumulated pulses")
+
+    width = max(len(l) for _, l in checks)
+    failed = sum(1 for p, _ in checks if not p)
+    for passed, label in checks:
+        print(f"  {'ok ' if passed else 'FAIL'}  {label:<{width}}")
+    print()
+    print(f"all {len(checks)} checks passed" if not failed
+          else f"{failed} of {len(checks)} checks failed")
+    return 1 if failed else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Kellogg phone GPIO self test")
     ap.add_argument("--raw", action="store_true",
                     help="log every Hall edge, for magnet calibration")
+    ap.add_argument("--selftest", action="store_true",
+                    help="CrankDetector checks, no hardware")
+    ap.add_argument("--invert-hook", action="store_true",
+                    help="flip the hookswitch sense for this run")
     args = ap.parse_args()
+    if args.selftest:
+        raise SystemExit(_selftest())
+    if args.invert_hook:
+        globals()["HOOK_INVERTED"] = True
     _run_raw() if args.raw else _run_events()
 
 
