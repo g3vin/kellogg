@@ -581,14 +581,35 @@ def build_phone(null_telephony: bool = False, no_gpio: bool = False) -> Phone:
         log.warning("printer: %s", phone.printer.last_error)
 
     # 6. telephony
+    #
+    # A backend that cannot start must NOT take the phone down with it.
+    # The rule is in CLAUDE.md: unregistered telephony still answers
+    # off-hook and the operator still speaks, it just cannot connect. A
+    # missing baresip, a dead trunk or no network are all normal states
+    # for a telephone in a house, not reasons to refuse to boot.
+    def _wire(backend) -> None:
+        backend.on_incoming_call = lambda num, name: phone.push(
+            EventKind.INCOMING_CALL, number=num, name=name)
+        backend.on_call_ended = lambda reason: phone.push(
+            EventKind.CALL_ENDED, reason=reason)
+        backend.on_message = lambda s, b, m: phone.push(
+            EventKind.MESSAGE, sender=s, body=b, media=m)
+
     phone.telephony = tel_mod.build("null" if null_telephony else "auto")
-    phone.telephony.on_incoming_call = lambda num, name: phone.push(
-        EventKind.INCOMING_CALL, number=num, name=name)
-    phone.telephony.on_call_ended = lambda reason: phone.push(
-        EventKind.CALL_ENDED, reason=reason)
-    phone.telephony.on_message = lambda s, b, m: phone.push(
-        EventKind.MESSAGE, sender=s, body=b, media=m)
-    phone.telephony.start()
+    _wire(phone.telephony)
+    try:
+        phone.telephony.start()
+    except Exception as exc:
+        log.warning("telephony could not start (%s)", exc)
+        log.warning("falling back to null - the operator will answer and "
+                    "speak, but cannot connect a call")
+        try:
+            phone.telephony.stop()
+        except Exception:
+            pass
+        phone.telephony = tel_mod.NullTelephony(log=lambda _: None)
+        _wire(phone.telephony)
+        phone.telephony.start()
     log.info("telephony: %s", phone.telephony.status())
 
     # 7. hardware last

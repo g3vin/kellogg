@@ -27,10 +27,20 @@
 [Unit]
 Description=Kellogg magneto phone
 Documentation=https://github.com/g3vin/kellogg
-After=network-online.target pipewire.service pipewire-pulse.service
+After=network-online.target
 Wants=network-online.target
-# If PipeWire dies the phone cannot hear or speak; follow it down and back.
-BindsTo=pipewire.service
+
+# PipeWire is NOT required. This build runs on bare ALSA: Raspberry Pi OS
+# Lite does not ship PipeWire, and the phone does not need it, because
+# the operator flow is half-duplex by construction - tts blocks until
+# playback finishes, so the recogniser never listens while the operator
+# is speaking.
+#
+# If you later install PipeWire for echo cancellation during live calls,
+# uncomment these two lines so the phone follows it down and back up:
+#
+#   After=pipewire.service pipewire-pulse.service
+#   BindsTo=pipewire.service
 
 [Service]
 Type=simple
