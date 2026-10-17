@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Text the Phone</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --rule: #e0ddd8;
+    --accent: #1f3a5f;
+    --note-bg: #f4f2ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c;
+      --fg: #e8e6e3;
+      --muted: #a4a09a;
+      --rule: #333740;
+      --accent: #8fb3dd;
+      --note-bg: #20232a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    margin: 0 auto;
+    max-width: 40rem;
+    padding: 3rem 1.25rem 4rem;
+    font-size: 17px;
+  }
+  h1 {
+    font-size: 2.1rem;
+    line-height: 1.15;
+    margin: 0 0 .5rem;
+    color: var(--accent);
+  }
+  .lede { font-size: 1.1rem; color: var(--muted); margin: 0 0 2.5rem; }
+  h2 {
+    font-size: 1.1rem;
+    margin: 2.25rem 0 .6rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--rule);
+  }
+  .cta {
+    background: var(--note-bg);
+    border-left: 3px solid var(--accent);
+    padding: 1.4rem 1.5rem;
+    margin: 2rem 0;
+  }
+  .cta p { margin: 0 0 .5rem; }
+  .cta .big {
+    font-size: 1.35rem;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+  code {
+    background: var(--note-bg);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .9em;
+  }
+  .cta code { background: transparent; padding: 0; font-size: inherit; }
+  .fine { color: var(--muted); font-size: .9rem; }
+  a { color: var(--accent); }
+  footer {
+    margin-top: 3rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--rule);
+    color: var(--muted);
+    font-size: .875rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>Text the Phone</h1>
+<p class="lede">
+  A 1900s Kellogg magneto wall telephone, rebuilt to answer, dial, and print.
+</p>
+
+<p>
+  Messages sent to this number are printed on a thermal receipt printer inside
+  the cabinet of a restored hand-crank telephone. It is a personal project, not
+  a business. Nothing is sold here and no marketing is ever sent.
+</p>
+
+<div class="cta">
+  <p class="big">Text <code>KELLOGG</code> to <code>(757) 383-9589</code></p>
+  <p class="fine">
+    You will get one message back asking you to confirm. Reply <code>Y</code>
+    and you are signed up. Message frequency varies. Message and data rates may
+    apply. Reply <code>STOP</code> to cancel or <code>HELP</code> for help.
+  </p>
+</div>
+
+<h2>What happens when you text</h2>
+<p>
+  Your message prints on paper in a wooden box on a wall. That is the whole
+  feature. You may also call the number and speak to whoever picks up the
+  handset.
+</p>
+
+<h2>What we do with your number</h2>
+<p>
+  We keep it so we can reply to you, and that is all.
+  We do not sell or share your SMS opt-in data or personal information with
+  third parties for marketing purposes. The full details are in the
+  <a href="./index.html">Privacy Policy</a> and
+  <a href="./terms.html">Terms &amp; Conditions</a>.
+</p>
+
+<h2>Stopping</h2>
+<p>
+  Reply <code>STOP</code> to any message and you will not hear from us again.
+  Reply <code>HELP</code> for help. There is no catch and nothing to unsubscribe
+  from beyond the conversation itself.
+</p>
+
+<footer>
+  Kellogg &middot;
+  <a href="./index.html">Privacy Policy</a> &middot;
+  <a href="./terms.html">Terms &amp; Conditions</a>
+</footer>
+
+</body>
+</html>
